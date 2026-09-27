@@ -14,7 +14,7 @@ else:
     sys.path.append(os.path.abspath("."))
 
 try:
-    from process import AromeWindProcessor
+    from process import WindProcessor
 except ImportError:
     pass  # Die Klasse 'AromeWindProcessor' ist in Colab bereits im RAM!
 
