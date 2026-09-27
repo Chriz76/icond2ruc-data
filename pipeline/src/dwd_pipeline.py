@@ -8,8 +8,15 @@ import glob
 from datetime import datetime, timezone, timedelta
 
 # Erlaubt den Import von process.py im selben Ordner
-sys.path.append(os.path.dirname(__file__))
-from process import WindProcessor
+if "__file__" in globals():
+    sys.path.append(os.path.dirname(__file__))
+else:
+    sys.path.append(os.path.abspath("."))
+
+try:
+    from process import AromeWindProcessor
+except ImportError:
+    pass  # Die Klasse 'AromeWindProcessor' ist in Colab bereits im RAM!
 
 # --- KONFIGURATION ---
 OUTPUT_DIR = "./output"
@@ -19,7 +26,10 @@ API_VERSION = "1.1.0"
 MAX_WEBP_COUNT = 50  # Maximal zu behaltende WebP-Dateien
 
 # ROOT_FOLDER zeigt dorthin, wo clat.grib2 und clon.grib2 liegen
-ROOT_FOLDER = os.path.dirname(__file__)
+if "__file__" in globals():
+    ROOT_FOLDER = os.path.dirname(__file__)
+else:
+    ROOT_FOLDER = os.path.abspath(".")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(TEMP_GRIB_DIR, exist_ok=True)
@@ -47,6 +57,59 @@ def download_file(url, local_path):
             time.sleep(wait_time)
 
     return False
+
+
+def process_single_hour(processor, target_time, f_hour, temp_dir=TEMP_GRIB_DIR, prefer_local=False):
+    """
+    Verarbeitet genau einen Schritt (Download optional).
+    - Wenn `prefer_local` True ist, werden vorhandene Dateien in `temp_dir` verwendet und nicht gelöscht.
+    - Wenn `prefer_local` False ist, werden fehlende Dateien heruntergeladen und anschließend (wie zuvor) gelöscht.
+    Rückgabe: (success: bool, time_key: str)
+    """
+    valid_time = target_time + timedelta(hours=f_hour)
+    time_key = valid_time.strftime('%Y%m%d_%H')
+    png_filename = f"{time_key}Z.png"
+
+    # URLs für U, V und VMAX (wie vorher)
+    url_u = f"https://opendata.dwd.de/weather/nwp/v1/m/icon-d2-ruc/p/U_10M/r/{target_time.strftime('%Y-%m-%dT%H%%3A00')}/s/PT{f_hour:03d}H00M.grib2"
+    url_v = f"https://opendata.dwd.de/weather/nwp/v1/m/icon-d2-ruc/p/V_10M/r/{target_time.strftime('%Y-%m-%dT%H%%3A00')}/s/PT{f_hour:03d}H00M.grib2"
+    url_vmax = f"https://opendata.dwd.de/weather/nwp/v1/m/icon-d2-ruc/p/VMAX_10M/r/{target_time.strftime('%Y-%m-%dT%H%%3A00')}/s/PT{f_hour+1:03d}H00M.grib2"
+
+    os.makedirs(temp_dir, exist_ok=True)
+    u_path = os.path.join(temp_dir, f"u_{time_key}.grib2")
+    v_path = os.path.join(temp_dir, f"v_{time_key}.grib2")
+    vmax_path = os.path.join(temp_dir, f"vmax_{time_key}.grib2")
+
+    have_local = os.path.exists(u_path) and os.path.exists(v_path) and os.path.exists(vmax_path)
+
+    if prefer_local and have_local:
+        print(f"   -> Verwende lokale GRIBs für {time_key} (prefer_local=True).")
+    else:
+        print(f"   -> Downloade Schritt +{f_hour}h...")
+        ok_u = os.path.exists(u_path) or download_file(url_u, u_path)
+        ok_v = os.path.exists(v_path) or download_file(url_v, v_path)
+        ok_vmax = os.path.exists(vmax_path) or download_file(url_vmax, vmax_path)
+        if not (ok_u and ok_v and ok_vmax):
+            print(f"   ❌ Fehler beim Download von Schritt +{f_hour}h.")
+            return False, time_key
+
+    success = processor.process_step(u_path, v_path, vmax_path, time_key, png_filename)
+
+    # Lösche nur, wenn prefer_local False (verhält sich ansonsten wie vorher: Dateien werden entfernt)
+    if not prefer_local:
+        for p in (u_path, v_path, vmax_path):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception as e:
+                print(f"   ⚠️ Fehler beim Löschen von {p}: {e}")
+    else:
+        print(f"   → GRIBs für {time_key} bleiben erhalten (prefer_local=True).")
+
+    if success:
+        print(f"      ✅ Schritt +{f_hour}h erfolgreich prozessiert.")
+
+    return success, time_key
 
 
 def cleanup_old_webps(output_dir, max_keep=50):
@@ -98,31 +161,8 @@ def run_ruc_pipeline():
     print(f"👑 Server bereit! Starte Verarbeitung von {len(missing_hours)} Schritten...")
 
     for f_hour in missing_hours:
-        valid_time = target_time + timedelta(hours=f_hour)
-        time_key = valid_time.strftime('%Y%m%d_%H')
-        png_filename = f"{time_key}Z.png"
-
-        # URLs für U, V und VMAX
-        url_u = f"https://opendata.dwd.de/weather/nwp/v1/m/icon-d2-ruc/p/U_10M/r/{target_time.strftime('%Y-%m-%dT%H%%3A00')}/s/PT{f_hour:03d}H00M.grib2"
-        url_v = f"https://opendata.dwd.de/weather/nwp/v1/m/icon-d2-ruc/p/V_10M/r/{target_time.strftime('%Y-%m-%dT%H%%3A00')}/s/PT{f_hour:03d}H00M.grib2"
-        url_vmax = f"https://opendata.dwd.de/weather/nwp/v1/m/icon-d2-ruc/p/VMAX_10M/r/{target_time.strftime('%Y-%m-%dT%H%%3A00')}/s/PT{f_hour+1:03d}H00M.grib2"
-
-        u_path = os.path.join(TEMP_GRIB_DIR, f"u_{time_key}.grib2")
-        v_path = os.path.join(TEMP_GRIB_DIR, f"v_{time_key}.grib2")
-        vmax_path = os.path.join(TEMP_GRIB_DIR, f"vmax_{time_key}.grib2")
-
-        print(f"   -> Downloade Schritt +{f_hour}h...")
-        if download_file(url_u, u_path) and download_file(url_v, v_path) and download_file(url_vmax, vmax_path):
-            success = processor.process_step(u_path, v_path, vmax_path, time_key, png_filename)
-
-            if os.path.exists(u_path): os.remove(u_path)
-            if os.path.exists(v_path): os.remove(v_path)
-            if os.path.exists(vmax_path): os.remove(vmax_path)
-
-            if success:
-                print(f"      ✅ Schritt +{f_hour}h erfolgreich prozessiert.")
-        else:
-            print(f"   ❌ Fehler beim Download von Schritt +{f_hour}h.")
+        # Verwende die neue helper-Funktion, Verhalten unverändert (default prefer_local=False)
+        success, _ = process_single_hour(processor, target_time, f_hour, temp_dir=TEMP_GRIB_DIR, prefer_local=False)
 
     # =========================================================================
     # FINALES SPEICHERN & DYNAMISCHE ERSTELLUNG DER INDEX.JSON
@@ -174,5 +214,14 @@ def run_ruc_pipeline():
     print("\n🎉 PIPELINE ERFOLGREICH BEENDET!")
 
 
+# --- STEUERUNG BEIM LADEN/AUSFÜHREN ---
 if __name__ == "__main__":
-    run_ruc_pipeline()
+    # Prüft, ob das Skript über ein Terminal/GitHub Actions gestartet wurde (sys.ps1 existiert nur in Shells nicht)
+    is_interactive = hasattr(sys, "ps1") or "ipykernel" in sys.modules
+
+    if not is_interactive:
+        # Auf GitHub Actions: Automatisch ausführen (stürzt ab, falls DWD_TARGET_RUN fehlt)
+        run_ruc_pipeline()
+    else:
+        # In Colab/Jupyter: Nur in den Speicher laden, Nichts tun
+        print("📦 Modul erfolgreich in den Colab-Speicher geladen (Pipeline nicht gestartet).")

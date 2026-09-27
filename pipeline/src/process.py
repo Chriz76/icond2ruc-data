@@ -1,4 +1,6 @@
 import os
+import math
+import gzip
 import orjson
 import pickle
 import xarray as xr
@@ -6,7 +8,23 @@ import numpy as np
 from PIL import Image
 import eccodes as ecc
 from scipy.interpolate import LinearNDInterpolator
+from pmtiles.writer import Writer
+from pmtiles.tile import TileType, Compression, zxy_to_tileid
 import time
+
+
+def tile_bounds_wgs84(z, x, y):
+    """Berechnet die exakte Bounding-Box (lon_min, lat_min, lon_max, lat_max)
+    einer Web-Mercator Kachel in WGS84 Grad.
+    """
+    n = 2.0 ** z
+    lon_min = x / n * 360.0 - 180.0
+    lon_max = (x + 1) / n * 360.0 - 180.0
+
+    lat_rad_max = math.atan(math.sinh(math.pi * (1.0 - 2.0 * y / n)))
+    lat_rad_min = math.atan(math.sinh(math.pi * (1.0 - 2.0 * (y + 1) / n)))
+
+    return lon_min, math.degrees(lat_rad_min), lon_max, math.degrees(lat_rad_max)
 
 
 class WindProcessor:
@@ -44,23 +62,23 @@ class WindProcessor:
             lon_deg = raw_lon
         lon_deg = np.where(lon_deg > 180, lon_deg - 360, lon_deg)
 
-        lon_min, lon_max = -4.1616, 20.5444
-        lat_min, lat_max = 43.0440, 58.1647
+        self.lon_min, self.lon_max = -4.1616, 20.5444
+        self.lat_min, self.lat_max = 43.0440, 58.1647
 
         lat_pts_rad = np.radians(lat_deg)
         y_pts_merc = np.degrees(np.log(np.tan(np.pi/4.0 + lat_pts_rad/2.0)))
         x_pts_merc = lon_deg
 
-        y_min_merc = np.degrees(np.log(np.tan(np.pi/4.0 + np.radians(lat_min)/2.0)))
-        y_max_merc = np.degrees(np.log(np.tan(np.pi/4.0 + np.radians(lat_max)/2.0)))
+        y_min_merc = np.degrees(np.log(np.tan(np.pi/4.0 + np.radians(self.lat_min)/2.0)))
+        y_max_merc = np.degrees(np.log(np.tan(np.pi/4.0 + np.radians(self.lat_max)/2.0)))
 
         self.width = 2000
-        self.height = int(self.width * (y_max_merc - y_min_merc) / (lon_max - lon_min))
+        self.height = int(self.width * (y_max_merc - y_min_merc) / (self.lon_max - self.lon_min))
 
-        dx_pixel = (lon_max - lon_min) / self.width
+        dx_pixel = (self.lon_max - self.lon_min) / self.width
         dy_pixel = (y_max_merc - y_min_merc) / self.height
 
-        grid_x_linear = np.linspace(lon_min + 0.5 * dx_pixel, lon_max - 0.5 * dx_pixel, self.width)
+        grid_x_linear = np.linspace(self.lon_min + 0.5 * dx_pixel, self.lon_max - 0.5 * dx_pixel, self.width)
         grid_y_merc = np.linspace(y_max_merc - 0.5 * dy_pixel, y_min_merc + 0.5 * dy_pixel, self.height)
         
         self.grid_x, self.grid_y = np.meshgrid(grid_x_linear, grid_y_merc)
@@ -70,8 +88,25 @@ class WindProcessor:
 
         self.interpolator = LinearNDInterpolator(points_merc, np.zeros(self.total_dwd_points, dtype=np.float64))
 
-        cluster_cols = np.floor((lon_deg - lon_min) / 1.0).astype(np.int32)
-        cluster_rows = np.floor((lat_deg - lat_min) / 1.0).astype(np.int32)
+        # ---------------------------------------------------------------------
+        # PMTILES GRID (Reguläres WGS84 0.02° Lat/Lon Raster)
+        # ---------------------------------------------------------------------
+        self.step_size = 0.02
+        self.pm_lats = np.arange(self.lat_min, self.lat_max + self.step_size, self.step_size)
+        self.pm_lons = np.arange(self.lon_min, self.lon_max + self.step_size, self.step_size)
+        self.src_lat_shape = len(self.pm_lats)
+        self.src_lon_shape = len(self.pm_lons)
+
+        pm_grid_lon, pm_grid_lat = np.meshgrid(self.pm_lons, self.pm_lats)
+        pm_points_wgs84 = np.vstack((lon_deg, lat_deg)).T.astype(np.float64)
+
+        self.pm_interpolator_u = LinearNDInterpolator(pm_points_wgs84, np.zeros(self.total_dwd_points, dtype=np.float64))
+        self.pm_interpolator_v = LinearNDInterpolator(pm_points_wgs84, np.zeros(self.total_dwd_points, dtype=np.float64))
+        self.pm_grid_lon = pm_grid_lon
+        self.pm_grid_lat = pm_grid_lat
+
+        cluster_cols = np.floor((lon_deg - self.lon_min) / 1.0).astype(np.int32)
+        cluster_rows = np.floor((lat_deg - self.lat_min) / 1.0).astype(np.int32)
 
         unique_clusters = np.unique(np.column_stack((cluster_cols, cluster_rows)), axis=0)
 
@@ -93,6 +128,113 @@ class WindProcessor:
 
         init_duration = time.perf_counter() - init_start_time
         print(f"✅ [Processor] Gitter reaktiviert: {self.width}x{self.height} Pixel | {len(self.cluster_mapping)} Cluster bereit. (Init time: {init_duration:.4f}s)")
+
+    def _create_wind_direction_pmtiles(self, u_grid_002, v_grid_002, output_pmtiles_path, min_zoom=0, max_zoom=8):
+        """Erzeugt binäre Float32 PMTiles mit Gzip-Komprimierung und 24-Byte Header aus dem 0.02° Raster."""
+        lats = self.pm_lats
+        lons = self.pm_lons
+
+        tiles_dict = {}
+
+        for z in range(min_zoom, max_zoom + 1):
+            stride = 2 ** (max_zoom - z)
+
+            u_lod = u_grid_002[::stride, ::stride]
+            v_lod = v_grid_002[::stride, ::stride]
+            lats_lod = lats[::stride]
+            lons_lod = lons[::stride]
+
+            n = 2 ** z
+            for x in range(n):
+                for y in range(n):
+                    t_lon_min, t_lat_min, t_lon_max, t_lat_max = tile_bounds_wgs84(z, x, y)
+
+                    if (t_lon_max < self.lon_min or t_lon_min > self.lon_max or
+                        t_lat_max < self.lat_min or t_lat_min > self.lat_max):
+                        continue
+
+                    col_indices = np.where((lons_lod >= t_lon_min) & (lons_lod <= t_lon_max))[0]
+                    row_indices = np.where((lats_lod >= t_lat_min) & (lats_lod <= t_lat_max))[0]
+
+                    if len(col_indices) == 0 or len(row_indices) == 0:
+                        continue
+
+                    c_start = col_indices[0]
+                    c_end = col_indices[-1] + 1
+
+                    r_start_idx = row_indices[-1]
+                    r_end_idx = row_indices[0]
+
+                    sub_u = u_lod[r_end_idx:r_start_idx + 1, c_start:c_end]
+                    sub_v = v_lod[r_end_idx:r_start_idx + 1, c_start:c_end]
+
+                    # Zeilen umkehren für North-Up
+                    sub_u = np.flipud(sub_u)
+                    sub_v = np.flipud(sub_v)
+
+                    rows, cols = sub_u.shape
+                    if rows == 0 or cols == 0:
+                        continue
+
+                    valid_mask = ~np.isnan(sub_u) & ~np.isnan(sub_v)
+                    if not np.any(valid_mask):
+                        continue
+
+                    # 1. HEADER (6x Float32 = 24 Bytes)
+                    origin_lng = float(lons_lod[c_start])
+                    origin_lat = float(lats_lod[r_start_idx])
+
+                    delta_lng = float(lons_lod[1] - lons_lod[0]) if len(lons_lod) > 1 else self.step_size * stride
+                    delta_lat = float(lats_lod[1] - lats_lod[0]) if len(lats_lod) > 1 else self.step_size * stride
+
+                    header_meta = np.array([
+                        origin_lng,
+                        origin_lat,
+                        delta_lng,
+                        delta_lat,
+                        float(rows),
+                        float(cols)
+                    ], dtype=np.float32)
+
+                    # 2. PAYLOAD (u, v verschachtelt als Float32)
+                    uv_interleaved = np.empty((rows, cols, 2), dtype=np.float32)
+                    uv_interleaved[:, :, 0] = sub_u
+                    uv_interleaved[:, :, 1] = sub_v
+
+                    raw_tile_bytes = header_meta.tobytes() + uv_interleaved.tobytes()
+                    compressed_tile_bytes = gzip.compress(raw_tile_bytes)
+
+                    tiles_dict[zxy_to_tileid(z, x, y)] = compressed_tile_bytes
+
+        with open(output_pmtiles_path, "wb") as f:
+            writer = Writer(f)
+
+            for tile_id in sorted(tiles_dict.keys()):
+                writer.write_tile(tile_id, tiles_dict[tile_id])
+
+            header = {
+                "tile_type": TileType.UNKNOWN,
+                "tile_compression": Compression.GZIP,
+                "min_zoom": min_zoom,
+                "max_zoom": max_zoom,
+                "min_lon": self.lon_min,
+                "min_lat": self.lat_min,
+                "max_lon": self.lon_max,
+                "max_lat": self.lat_max,
+                "center_zoom": 5,
+                "center_lon": (self.lon_min + self.lon_max) / 2.0,
+                "center_lat": (self.lat_min + self.lat_max) / 2.0
+            }
+
+            metadata = {
+                "name": "DWD Wind Vector Binary PMTiles (0.02°)",
+                "format": "binary",
+                "description": "24 Byte Float32 Header + Interleaved Float32 (U, V) Payload mit Gzip."
+            }
+
+            writer.finalize(header, metadata)
+
+        return True
 
     def process_step(self, u_path, v_path, gust_path, time_key, filename):
         step_start_time = time.perf_counter()
@@ -205,7 +347,26 @@ class WindProcessor:
         print(f"    ⏱️ WebP Speichern (Lossless, method=4): {webp_save_duration:.4f}s")
 
         # ---------------------------------------------------------------------
-        # TEIL B: EFFIZIENTES JSON-UPDATE IM RAM (OHNE REDUNDANZEN)
+        # TEIL B: PMTILES ERSTELLUNG (0.02° WGS84 Resampling)
+        # ---------------------------------------------------------------------
+        pm_start = time.perf_counter()
+        self.pm_interpolator_u.values[:, 0] = u_slice
+        self.pm_interpolator_v.values[:, 0] = v_slice
+
+        u_grid_002 = self.pm_interpolator_u(self.pm_grid_lon, self.pm_grid_lat).astype(np.float32)
+        v_grid_002 = self.pm_interpolator_v(self.pm_grid_lon, self.pm_grid_lat).astype(np.float32)
+
+        # Auf 2 Nachkommastellen runden (eliminiert Interpolations-Noise & steigert Gzip enorm)
+        u_grid_002 = np.round(u_grid_002, decimals=2).astype(np.float32)
+        v_grid_002 = np.round(v_grid_002, decimals=2).astype(np.float32)
+
+        pmtiles_filename = filename.split('.')[0] + "_dir.pmtiles"
+        output_pmtiles_path = os.path.join(self.output_folder, pmtiles_filename)
+        self._create_wind_direction_pmtiles(u_grid_002, v_grid_002, output_pmtiles_path)
+        print(f"    ⏱️ PMTiles (0.02°) generiert in: {time.perf_counter() - pm_start:.4f}s")
+
+        # ---------------------------------------------------------------------
+        # TEIL C: EFFIZIENTES JSON-UPDATE IM RAM (OHNE REDUNDANZEN)
         # ---------------------------------------------------------------------
         json_agg_start = time.perf_counter()
         for (col, row), meta in self.cluster_mapping.items():
