@@ -26,7 +26,7 @@ jobs:
       - name: Checkout Existing Data (gh-pages-dev)
         uses: actions/checkout@v4
         with:
-          ref: gh-pages-dev
+          ref: gh-pages
           path: output
           fetch-depth: 1
         continue-on-error: true
@@ -52,44 +52,18 @@ jobs:
           DWD_TARGET_RUN: ${{ github.event.inputs.dwd_run }}
         run: python pipeline/src/dwd_pipeline.py
 
-      - name: Create _headers file for CORS
-        run: |
-          cat <<EOF > output/_headers
-          /*
-            Access-Control-Allow-Origin: *
-            Access-Control-Allow-Headers: Content-Type, Authorization
-          EOF
-      # ==========================================
-      # NEU: Upload des 'output' Ordners zu Cloudflare Pages
-      # ==========================================
-      - name: Deploy Data to Cloudflare Pages
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.NETLIFY_AUTH_TOKEN }}
-          accountId: c728452fcd5090f3d7f2bacc5e75fcd2
-          command: pages deploy output --project-name=winddata --branch=main
-          # Cloudflare erlaubt es, CORS-Header direkt hier zu definieren:
-          headers: |
-            /*
-              Access-Control-Allow-Origin: *
-              Access-Control-Allow-Headers: Content-Type, Authorization
-      # ==========================================
-
-      - name: Force-Push Data Branch (gh-pages-dev)
+      - name: Force-Push Data Branch (gh-pages)
         run: |
           cd output
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           
-          # Erstellt einen frischen, isolierten Branch ohne Historie
-          git checkout --orphan temp-data-branch
+          # Erstellt einen frischen Branch ohne History (falls er neu ist) 
+          # oder hält die Datei-Nachverfolgung sauber aufrecht
+          git checkout --orphan temp-branch || true
           
           git add -A
           git commit -m "DWD Weather Pipeline - Live State [skip ci]"
           
-          # Remote URL anpassen
-          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" || \
-          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
-          
-          # Pusht den Inhalt von 'temp-data-branch' direkt in den Remote-Branch 'gh-pages-dev'
-          git push --force origin temp-data-branch:gh-pages-dev
+          # Drückt den Commit als einzigen Commit auf gh-pages
+          git push --force origin HEAD:gh-pages          git push --force origin temp-data-branch:gh-pages-dev
