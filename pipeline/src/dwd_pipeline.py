@@ -24,6 +24,7 @@ TEMP_GRIB_DIR = "./grib_temp"
 FORECASTLENGTH = 24
 API_VERSION = "1.1.0"
 MAX_WEBP_COUNT = 50  # Maximal zu behaltende WebP-Dateien
+MAX_PMTILES_COUNT = 50  # Maximal zu behaltende PMTiles-Dateien
 
 # ROOT_FOLDER zeigt dorthin, wo clat.grib2 und clon.grib2 liegen
 if "__file__" in globals():
@@ -112,24 +113,31 @@ def process_single_hour(processor, target_time, f_hour, temp_dir=TEMP_GRIB_DIR, 
     return success, time_key
 
 
-def cleanup_old_webps(output_dir, max_keep=50):
-    """Löscht ältere WebP-Dateien im Ausgabeordner basierend auf dem Dateinamen."""
-    webp_files = glob.glob(os.path.join(output_dir, "*.webp"))
-    
-    if len(webp_files) > max_keep:
-        print(f"\n🧹 Bereinige alte WebPs ({len(webp_files)} vorhanden, maximal {max_keep} erlaubt)...")
+def cleanup_old_files(output_dir, glob_pattern, max_keep=50, label="Dateien"):
+    """Löscht ältere Dateien im Ausgabeordner basierend auf dem Dateinamen.
+
+    Parameter:
+    - output_dir:     Ordner, in dem gesucht wird.
+    - glob_pattern:   Muster der zu bereinigenden Dateien (z. B. "*.webp").
+    - max_keep:       Anzahl der neuesten Dateien, die behalten werden.
+    - label:          Bezeichnung für die Ausgabe (z. B. "WebP" / "PMTiles").
+    """
+    files = glob.glob(os.path.join(output_dir, glob_pattern))
+
+    if len(files) > max_keep:
+        print(f"\n🧹 Bereinige alte {label} ({len(files)} vorhanden, maximal {max_keep} erlaubt)...")
         # Alphabethische Sortierung nach Dateinamen (älteste Timestamps stehen vorne)
-        webp_files.sort()
-        
+        files.sort()
+
         # Alle Dateien bis auf die letzten max_keep (die neuesten) löschen
-        files_to_delete = webp_files[:-max_keep]
+        files_to_delete = files[:-max_keep]
         for file_path in files_to_delete:
             try:
                 os.remove(file_path)
                 print(f"   🗑️ Gelöscht: {os.path.basename(file_path)}")
             except Exception as e:
                 print(f"   ⚠️ Fehler beim Löschen von {file_path}: {e}")
-        print(f"✅ Bereinigung abgeschlossen. Es verbleiben {max_keep} WebP-Dateien.")
+        print(f"✅ Bereinigung abgeschlossen. Es verbleiben {max_keep} {label}-Dateien.")
 
 
 def run_ruc_pipeline():
@@ -205,7 +213,10 @@ def run_ruc_pipeline():
         print("⚠️ Warnung: Keine Daten-Timestamps für index.json gefunden.")
 
     # Alte WebP-Dateien nach Dateinamen-Sortierung bereinigen
-    cleanup_old_webps(OUTPUT_DIR, max_keep=MAX_WEBP_COUNT)
+    cleanup_old_files(OUTPUT_DIR, "*.webp", max_keep=MAX_WEBP_COUNT, label="WebP")
+
+    # Alte PMTiles-Dateien nach Dateinamen-Sortierung bereinigen
+    cleanup_old_files(OUTPUT_DIR, "*.pmtiles", max_keep=MAX_PMTILES_COUNT, label="PMTiles")
 
     if os.path.exists(TEMP_GRIB_DIR):
         shutil.rmtree(TEMP_GRIB_DIR)
