@@ -71,17 +71,15 @@ def process_single_hour(processor, target_time, f_hour, temp_dir=TEMP_GRIB_DIR, 
     time_key = valid_time.strftime('%Y%m%d_%H')
     png_filename = f"{time_key}Z.png"
 
-    # URLs für U, V und VMAX (wie vorher)
+    # URLs für U und V
     url_u = f"https://opendata.dwd.de/weather/nwp/v1/m/icon-d2-ruc/p/U_10M/r/{target_time.strftime('%Y-%m-%dT%H%%3A00')}/s/PT{f_hour:03d}H00M.grib2"
     url_v = f"https://opendata.dwd.de/weather/nwp/v1/m/icon-d2-ruc/p/V_10M/r/{target_time.strftime('%Y-%m-%dT%H%%3A00')}/s/PT{f_hour:03d}H00M.grib2"
-    url_vmax = f"https://opendata.dwd.de/weather/nwp/v1/m/icon-d2-ruc/p/VMAX_10M/r/{target_time.strftime('%Y-%m-%dT%H%%3A00')}/s/PT{f_hour+1:03d}H00M.grib2"
 
     os.makedirs(temp_dir, exist_ok=True)
     u_path = os.path.join(temp_dir, f"u_{time_key}.grib2")
     v_path = os.path.join(temp_dir, f"v_{time_key}.grib2")
-    vmax_path = os.path.join(temp_dir, f"vmax_{time_key}.grib2")
 
-    have_local = os.path.exists(u_path) and os.path.exists(v_path) and os.path.exists(vmax_path)
+    have_local = os.path.exists(u_path) and os.path.exists(v_path)
 
     if prefer_local and have_local:
         print(f"   -> Verwende lokale GRIBs für {time_key} (prefer_local=True).")
@@ -89,16 +87,15 @@ def process_single_hour(processor, target_time, f_hour, temp_dir=TEMP_GRIB_DIR, 
         print(f"   -> Downloade Schritt +{f_hour}h...")
         ok_u = os.path.exists(u_path) or download_file(url_u, u_path)
         ok_v = os.path.exists(v_path) or download_file(url_v, v_path)
-        ok_vmax = os.path.exists(vmax_path) or download_file(url_vmax, vmax_path)
-        if not (ok_u and ok_v and ok_vmax):
+        if not (ok_u and ok_v):
             print(f"   ❌ Fehler beim Download von Schritt +{f_hour}h.")
             return False, time_key
 
-    success = processor.process_step(u_path, v_path, vmax_path, time_key, png_filename)
+    success = processor.process_step(u_path, v_path, png_filename)
 
     # Lösche nur, wenn prefer_local False (verhält sich ansonsten wie vorher: Dateien werden entfernt)
     if not prefer_local:
-        for p in (u_path, v_path, vmax_path):
+        for p in (u_path, v_path):
             try:
                 if os.path.exists(p):
                     os.remove(p)
@@ -157,53 +154,50 @@ def run_ruc_pipeline():
     print(f"========================================================")
 
     # Initialisiere den WindProcessor anhand deines korrekten Setups
-    processor = WindProcessor(root_folder=ROOT_FOLDER, output_folder=OUTPUT_DIR, timeLineLength=FORECASTLENGTH + 5)
-    processor.cluster_output_folder = os.path.join(OUTPUT_DIR, "grid_cluster")
-    os.makedirs(processor.cluster_output_folder, exist_ok=True)
+    processor = WindProcessor(root_folder=ROOT_FOLDER, output_folder=OUTPUT_DIR)
 
     detected_current_hour = target_time.strftime('%Y%m%d_%H')
 
     # Da Cloudflare steuert, laden wir stur alle Schritte (0 bis 24) für diesen Lauf
     missing_hours = list(range(FORECASTLENGTH + 1))
 
+    # Timestamps der erfolgreich verarbeiteten Schritte (analog zur AROME-Pipeline:
+    # die Rückgabewerte der Verarbeitungsschleife).
+    processed_timestamps = []
+
     print(f"👑 Server bereit! Starte Verarbeitung von {len(missing_hours)} Schritten...")
 
     for f_hour in missing_hours:
         # Verwende die neue helper-Funktion, Verhalten unverändert (default prefer_local=False)
-        success, _ = process_single_hour(processor, target_time, f_hour, temp_dir=TEMP_GRIB_DIR, prefer_local=False)
+        success, time_key = process_single_hour(processor, target_time, f_hour, temp_dir=TEMP_GRIB_DIR, prefer_local=False)
+        if success:
+            processed_timestamps.append(time_key)
 
     # =========================================================================
-    # FINALES SPEICHERN & DYNAMISCHE ERSTELLUNG DER INDEX.JSON
+    # DYNAMISCHE ERSTELLUNG DER INDEX.JSON
     # =========================================================================
-    processor.flush_json_to_disk()
 
-    all_timestamps = []
-    if processor.cluster_memory:
-        first_cluster = next(iter(processor.cluster_memory.values()))
-        if "timeline" in first_cluster:
-            all_timestamps = list(first_cluster["timeline"].keys())
+    # Wie in der AROME-Pipeline: Liste der tatsächlich erzeugten Schritte, sortiert und
+    # dedupliziert. Der Index hängt damit nur noch an den Verarbeitungsschritten.
+    all_timestamps = sorted(set(processed_timestamps))
 
     if all_timestamps:
         index_path = os.path.join(OUTPUT_DIR, "index.json")
-        sorted_timestamps = sorted(all_timestamps)
 
-        if detected_current_hour and detected_current_hour in sorted_timestamps:
+        if detected_current_hour in all_timestamps:
             current_hour = detected_current_hour
         else:
-            if len(sorted_timestamps) >= FORECASTLENGTH + 5:
-                current_hour = sorted_timestamps[len(sorted_timestamps) // 2]
-            else:
-                current_hour = sorted_timestamps[-1]
+            current_hour = all_timestamps[0]
 
         index_data = {
             "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "available_timestamps": sorted_timestamps,
+            "available_timestamps": all_timestamps,
             "current_hour": current_hour,
             "api_version": API_VERSION
         }
 
         print(f"\n📝 [Main Program] Generiere {index_path}...")
-        print(f"   -> Verfügbare Schritte im Frontend: {len(sorted_timestamps)}")
+        print(f"   -> Verfügbare Schritte im Frontend: {len(all_timestamps)}")
         print(f"   -> Exakt detektierter Standard-Fokus (current_hour): {current_hour}")
 
         with open(index_path, "w") as f:

@@ -1,9 +1,6 @@
 import os
 import math
 import gzip
-import orjson
-import pickle
-import xarray as xr
 import numpy as np
 from PIL import Image
 import eccodes as ecc
@@ -28,15 +25,10 @@ def tile_bounds_wgs84(z, x, y):
 
 
 class WindProcessor:
-    def __init__(self, root_folder, timeLineLength, output_folder="./wind_tiles_simulation"):
+    def __init__(self, root_folder, output_folder="./wind_tiles_simulation"):
         init_start_time = time.perf_counter()
         self.output_folder = output_folder
-        self.cluster_output_folder = os.path.join(output_folder, "grid_cluster")
-        os.makedirs(self.cluster_output_folder, exist_ok=True)
         self.root_folder = root_folder
-        self.timeLineLength = timeLineLength
-        
-        self.cluster_memory = {}
 
         clat_path = os.path.join(self.root_folder, "clat.grib2")
         clon_path = os.path.join(self.root_folder, "clon.grib2")
@@ -105,20 +97,6 @@ class WindProcessor:
         self.pm_grid_lon = pm_grid_lon
         self.pm_grid_lat = pm_grid_lat
 
-        cluster_cols = np.floor((lon_deg - self.lon_min) / 1.0).astype(np.int32)
-        cluster_rows = np.floor((lat_deg - self.lat_min) / 1.0).astype(np.int32)
-
-        unique_clusters = np.unique(np.column_stack((cluster_cols, cluster_rows)), axis=0)
-
-        self.cluster_mapping = {}
-        for col, row in unique_clusters:
-            point_indices = np.where((cluster_cols == col) & (cluster_rows == row))[0]
-            self.cluster_mapping[(int(col), int(row))] = {
-                "indices": point_indices,
-                "lats": np.round(lat_deg[point_indices], 4).tolist(),
-                "lons": np.round(lon_deg[point_indices], 4).tolist()
-            }
-
         scipy_warmup_start_init = time.perf_counter()
         dummy_input_warmup = np.zeros((self.total_dwd_points, 1), dtype=np.float64)
         self.interpolator.values[:, 0] = dummy_input_warmup[:, 0]
@@ -127,7 +105,7 @@ class WindProcessor:
         print(f"    ⏱️ SciPy Interpolator Warmup (in init): {scipy_warmup_duration_init:.4f}s")
 
         init_duration = time.perf_counter() - init_start_time
-        print(f"✅ [Processor] Gitter reaktiviert: {self.width}x{self.height} Pixel | {len(self.cluster_mapping)} Cluster bereit. (Init time: {init_duration:.4f}s)")
+        print(f"✅ [Processor] Gitter reaktiviert: {self.width}x{self.height} Pixel. (Init time: {init_duration:.4f}s)")
 
     def _create_wind_direction_pmtiles(self, u_grid_002, v_grid_002, output_pmtiles_path, min_zoom=0, max_zoom=8):
         """Erzeugt binäre Float32 PMTiles mit Gzip-Komprimierung und 24-Byte Header aus dem 0.02° Raster."""
@@ -236,10 +214,10 @@ class WindProcessor:
 
         return True
 
-    def process_step(self, u_path, v_path, gust_path, time_key, filename):
+    def process_step(self, u_path, v_path, filename):
         step_start_time = time.perf_counter()
 
-        if not os.path.exists(u_path) or not os.path.exists(v_path) or not os.path.exists(gust_path):
+        if not os.path.exists(u_path) or not os.path.exists(v_path):
             print(f"⚠️ GRIB2-Dateien für {filename} unvollständig. Überspringe Verarbeitung.")
             return False
 
@@ -266,16 +244,6 @@ class WindProcessor:
                 pass
             ecc.codes_release(gid_v)
 
-        with open(gust_path, 'rb') as f:
-            gid_gust = ecc.codes_grib_new_from_file(f)
-            gust_values = ecc.codes_get_array(gid_gust, 'values')
-            try:
-                gust_missing_value = ecc.codes_get(gid_gust, 'missingValue')
-                gust_values[gust_values == gust_missing_value] = np.nan
-            except ecc.CodesInternalError:
-                pass
-            ecc.codes_release(gid_gust)
-
         grib_load_duration = time.perf_counter() - grib_load_start
         print(f"    ⏱️ GRIB-Ladezeit: {grib_load_duration:.4f}s")
 
@@ -286,16 +254,9 @@ class WindProcessor:
 
         u_slice = u_values[:min_len].astype(np.float64)
         v_slice = v_values[:min_len].astype(np.float64)
-        raw_dir_deg = 270.0 - np.degrees(np.arctan2(v_slice, u_slice))
-        wind_dir_pts = np.mod(raw_dir_deg, 360.0)
-        current_gust_pts = gust_values[:min_len].astype(np.float64) * 1.94384
 
         wind_calc_duration = time.perf_counter() - wind_calc_start
-        print(f"    ⏱️ Windberechnung (Knots, Richtung, Böen): {wind_calc_duration:.4f}s")
-
-        rounded_wind_pts = np.round(current_wind_pts, 1)
-        rounded_wind_dir = np.round(wind_dir_pts, 0)
-        rounded_gust_pts = np.round(current_gust_pts, 0)
+        print(f"    ⏱️ Windberechnung (Knots): {wind_calc_duration:.4f}s")
 
         # ---------------------------------------------------------------------
         # TEIL A: BILD GENERIERUNG
@@ -365,77 +326,7 @@ class WindProcessor:
         self._create_wind_direction_pmtiles(u_grid_002, v_grid_002, output_pmtiles_path)
         print(f"    ⏱️ PMTiles (0.02°) generiert in: {time.perf_counter() - pm_start:.4f}s")
 
-        # ---------------------------------------------------------------------
-        # TEIL C: EFFIZIENTES JSON-UPDATE IM RAM (OHNE REDUNDANZEN)
-        # ---------------------------------------------------------------------
-        json_agg_start = time.perf_counter()
-        for (col, row), meta in self.cluster_mapping.items():
-            cluster_key = (col, row)
-
-            if cluster_key not in self.cluster_memory:
-                cluster_filename = os.path.join(self.cluster_output_folder, f"cluster_{col}_{row}.json")
-                if os.path.exists(cluster_filename):
-                    with open(cluster_filename, "rb") as jf:
-                        try:
-                            self.cluster_memory[cluster_key] = orjson.loads(jf.read())
-                        except Exception:
-                            self.cluster_memory[cluster_key] = {
-                                "col": col, "row": row,
-                                "lats": meta["lats"], "lons": meta["lons"],
-                                "timeline": {}
-                            }
-                else:
-                    self.cluster_memory[cluster_key] = {
-                        "col": col, "row": row,
-                        "lats": meta["lats"], "lons": meta["lons"],
-                        "timeline": {}
-                    }
-
-            idx = meta["indices"]
-
-            self.cluster_memory[cluster_key]["timeline"][time_key] = {
-                "speeds": rounded_wind_pts[idx],
-                "dirs": rounded_wind_dir[idx],
-                "gusts": rounded_gust_pts[idx]
-            }
-
-            if len(self.cluster_memory[cluster_key]["timeline"]) > self.timeLineLength:
-                sorted_keys = sorted(self.cluster_memory[cluster_key]["timeline"].keys())
-                del self.cluster_memory[cluster_key]["timeline"][sorted_keys[0]]
-
-        json_agg_duration = time.perf_counter() - json_agg_start
-        print(f"    ⏱️ JSON RAM Aggregation (Flache Parallel-Arrays): {json_agg_duration:.4f}s")
-
         total_step_duration = time.perf_counter() - step_start_time
         print(f"    ⏱️ Total process_step duration: {total_step_duration:.4f}s")
 
         return True
-
-    def flush_json_to_disk(self):
-        flush_start_time = time.perf_counter()
-        if not self.cluster_memory:
-            print("💾 [Processor] Kein Cluster-Speicher zum Schreiben vorhanden.")
-            return
-        print(f"\n💾 [Processor] Schreibe {len(self.cluster_memory)} optimierte JSON-Cluster gesammelt in den lokalen Output-Ordner...")
-
-        total_serialization_time = 0.0
-        total_write_time = 0.0
-
-        for (col, row), cluster_data in self.cluster_memory.items():
-            cluster_filename = os.path.join(self.cluster_output_folder, f"cluster_{col}_{row}.json")
-
-            serialization_start = time.perf_counter()
-            json_bytes = orjson.dumps(cluster_data, option=orjson.OPT_SERIALIZE_NUMPY)
-            serialization_duration = time.perf_counter() - serialization_start
-            total_serialization_time += serialization_duration
-
-            write_start = time.perf_counter()
-            with open(cluster_filename, "wb") as json_file:
-                json_file.write(json_bytes)
-            write_duration = time.perf_counter() - write_start
-            total_write_time += write_duration
-
-        flush_duration = time.perf_counter() - flush_start_time
-        print(f"✅ Alle JSON-Files im lokalen Output-Ordner gespeichert! (Flush time: {flush_duration:.4f}s)")
-        print(f"    ⏱️ Summe JSON Serialisierung (orjson): {total_serialization_time:.4f}s")
-        print(f"    ⏱️ Summe File Writing (file.write): {total_write_time:.4f}s")

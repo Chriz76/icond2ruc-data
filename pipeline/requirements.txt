@@ -1,9 +1,6 @@
 eccodes-python
-cfgrib
-xarray
 numpy
 Pillow
 scipy
 requests
-orjson
 pmtiles
